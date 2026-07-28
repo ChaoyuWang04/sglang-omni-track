@@ -1,0 +1,193 @@
+# Measurement spec for #1018 §1.2 — Thinker admission cap A/B + baseline qualification
+# Single source of truth: https://github.com/sgl-project/sglang-omni/issues/1018
+#   (section 1.2 + Benchmark Contract, body updatedAt 2026-07-27T01:24:39Z;
+#    verbatim dump: evidence/i1018_post_edit.md)
+# Companion issue (closed, historical): #1024. Calibration reference: PR #1135.
+# All tools read this file; no gate number or ladder is hardcoded in code.
+
+meta:
+  task: "1.2 Thinker admission cap and baseline qualification"
+  spec_source: "gh issue view 1018 --repo sgl-project/sglang-omni (2026-07-27)"
+  workspace_outputs: results/i1024_1p2/
+
+model:
+  path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  dtype: bfloat16
+  tensor_parallel: 2
+  hardware: "2x H100 (dedicated)"
+  # Contract §Placement (verbatim): "The canonical single-host profile uses thinker
+  # TP2 across two H100s. The audio encoder is colocated with thinker rank 0; talker
+  # and code2wav are colocated with thinker rank 1."
+  placement: canonical-single-host
+
+serving:
+  framework: sglang-omni
+  # Matches PR #1135's calibration environment; declared here, recorded in manifest.
+  mem_fraction_static: 0.85
+  # === All three launch unknowns locally verified 2026-07-27 (evidence/serve_config_probes.md) ===
+  # (a) serve command (merged-config probe confirmed every override lands):
+  #     sgl-omni serve --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct --text-only \
+  #       --thinker-tp-size 2 --thinker-gpus 0,1 --mem-fraction-static 0.85 \
+  #       --thinker-max-running-requests {16|64} --config harness/pipeline_1p2.yaml --port 8000
+  # (b) cap override: CLI --thinker-max-running-requests (added by #1135; targets thinker
+  #     only in both text/speech variants; propagates to cuda_graph_max_bs/cuda_graph_bs/
+  #     torch_compile_max_bs). YAML equivalent:
+  #     runtime_overrides.thinker.server_args_overrides.max_running_requests
+  # (c) decode_log_interval: runtime_overrides.thinker.server_args_overrides.decode_log_interval
+  #     in a FULL pipeline config via --config (partial dotted extra-args rejected for
+  #     non-preexisting keys). Template: harness/pipeline_1p2.yaml. ServerArgs default 40.
+  # Note: server_args_builder hardcodes random_seed=123 (greedy unaffected; in manifest).
+  pipeline_config: harness/pipeline_1p2.yaml   # carries decode_log_interval: 8
+  port: 8000
+
+workload:
+  modality: text_to_text
+  # 96 unique prompts x ~200 words, fixed file; sha256 pinned in the run manifest.
+  # Unique prefixes per request satisfy the contract's cold-start rule.
+  prompt_set: harness/prompts_200w_96.jsonl
+  output_tokens: 128
+  streaming: true
+  sampling:
+    # #1018 §1.2 verbatim: "one prompt, cache, and seedless greedy sampling contract"
+    contract: seedless-greedy
+    temperature: 0.0
+    # greedy argmax never consults a seed; recorded as null per Required Run Fields,
+    # with a note (contract modality table mentions seeds; no-op under greedy).
+    seed: null
+
+cache:
+  # Contract §Cache State: cold-start levels reset the cache before the level and
+  # use unique request prefixes. sglang-omni exposes no /flush_cache route; instead
+  # the radix/prefix cache is disabled at launch, making every request cold by
+  # construction (prefix-hit state = 0, recorded in the manifest). Declared in the
+  # contract draft for confirmation.
+  mode: cold
+  reset_method: disable-radix-cache-at-launch
+  unique_prefixes: true
+
+ladders:
+  # §1.2 Plan: baseline rebuild at c 1, 8, 16, 32
+  baseline: [1, 8, 16, 32]
+  # §1.2 Admission A/B: cap 16 vs 64 at c 1, 16, 32, 48
+  admission_ab: [1, 16, 32, 48]
+
+arms:
+  A: { max_running_requests: 16 }   # documented rollback value
+  B: { max_running_requests: 64 }   # #1135 default
+
+repeats:
+  # Contract: "at least two identical baseline arms" define the A/A noise band.
+  aa_arms: 2
+  # Contract: "at least K=3 paired A/B repeats".
+  ab_pairs: 3
+
+requests:
+  # Contract: "at least 32 successful requests per repeat" per level.
+  min_success_per_level: 32
+  # 96 = full prompt set per level (matches #1135's 96 prompts).
+  requests_per_level: 96
+  warmup_requests: 4          # excluded from all aggregates and wall clock
+  timeout_s: 300
+  record_failed: true         # failed requests reported, never dropped
+
+gates:
+  baseline:
+    # §1.2 verbatim: "Every concurrency level completes under the declared contract
+    # and reports TTFT, total latency, output throughput, request count, and output
+    # token count."
+    required_fields: [ttft, total_latency, output_throughput, request_count, output_token_count]
+  admission:
+    improve:
+      levels: [32, 48]
+      metric: output_throughput
+      # Strict per-repeat reading of "improves beyond the noise band across three
+      # paired repeats": every one of the K pairs must exceed the band.
+      # (Interpretation declared in the contract draft for Wenyao to confirm.)
+      rule: each_repeat_exceeds_noise_band
+    regression:
+      levels: [1, 16]
+      metrics: [output_throughput, ttft_p95, latency_p95]
+      max_regression_pct: 5.0    # any metric worse than -5% at c1/c16 => FAIL
+    block_on: [output_mismatch, new_failure, stage_exit]
+  noise:
+    # Contract: baseline noise >5% e2e (2% micro) => benchmark not promotion-capable.
+    e2e_max_noise_pct: 5.0
+  report_style: "gate was X, measured Y -> verdict"   # per #1025 write-up style
+
+token_equivalence:
+  # #1024 checklist verbatim: "output checks pass". Greedy cap16 vs cap64 outputs
+  # diffed pairwise per prompt. Chat API returns decoded text (not token ids), so
+  # the diff operates on completion text + completion_tokens count; declared in
+  # the contract draft.
+  compare: [completion_text, completion_tokens]
+  expected_mismatches: 0
+
+telemetry:
+  # Full source map: docs/telemetry_paths_1p2.md
+  event_recorder:
+    # MEASURED 2026-07-27 (anomalies.md #6): an ACTIVE recorder costs 25-30%
+    # output throughput at c>=32 (emit sits on the launch/resolve critical path
+    # and eats the async-lookahead host-overlap margin; patch at rest is free —
+    # verified 2252 tok/s c32 with patch applied, recorder off). Therefore the
+    # recorder stays OFF for every perf arm; lookahead-event evidence comes from
+    # the dedicated non-perf `events_probe` stage in h100_run.sh.
+    enable: false
+    start_route: /start_request_profile
+    stop_route: /stop_request_profile
+    event_dir: results/i1024_1p2/events
+  scrape_stage_logs: true    # decode-log line: #running-req/#token/usage/graph/#queue-req
+  lookahead_events:
+    status: absent-upstream  # requires the minimal instrumentation patch (open item)
+    patch_sites:
+      - "sglang_omni/scheduling/omni_scheduler.py:1952-1972 (decision)"
+      - "sglang_omni/scheduling/omni_scheduler.py:941-973 + model_runner/base.py:227-233 (launch/resolve, query_hit)"
+
+calibration:
+  # Replicate PR #1135's table BEFORE the formal matrix; numbers must align.
+  # PR body verbatim: "96 prompts, 200 words in / 128 tokens out, seed 1234,
+  # streaming. H100 2x dedicated GPUs, mem-fraction 0.85."  Baseline commit bfcfabec.
+  source: "gh pr view 1135 --repo sgl-project/sglang-omni"
+  prompts: 96
+  input_words: 200
+  output_tokens: 128
+  # #1135 PR body says "seed 1234", but passing an API seed trips the
+  # sampling_seed gate in thinker lookahead_eligible (#1047, predates the #1135
+  # baseline commit) and forces the SYNC decode path — measured 30-40% slower at
+  # bs>=2, which cannot be what the #1135 table shows. Under greedy, seed never
+  # affects token choice, so seedless replicates #1135's actual async-path
+  # conditions. Deviation approved by Chaoyu 2026-07-27; sync-path seed=1234
+  # data archived at results/i1024_1p2/h100_r1/calib_seed1234_syncpath/.
+  # Evidence: anomalies.md #4.
+  seed: null                 # seedless (see note above); formal matrix is also seedless greedy
+  streaming: true
+  mem_fraction_static: 0.85
+  concurrency: [1, 16, 32, 48, 64]
+  arms: [16, 64]             # align base + 64 columns of the #1135 table
+  reference:
+    output_tok_s: { c1: [204, 194], c16: [1449, 1906], c32: [2061, 2218], c48: [2052, 2303], c64: [2056, 2228] }
+    ttft_p95_s:   { c1: [0.05, 0.07], c16: [0.22, 0.21], c32: [1.15, 0.26], c48: [2.18, 0.35], c64: [3.15, 0.45] }
+
+native_audio_baseline:
+  # #1024 checklist item 3: "Record the native audio -> text baseline in the same
+  # sweep (currently missing)". Contract modality row (verbatim): "c {1,16,32,48};
+  # at least three PCM fixtures spanning short, medium, and long input;
+  # deterministic prompt set, output length, and seed."
+  payload: 'top-level "audios": [<server-readable path>], user content ""'
+  ladder: [1, 16, 32, 48]
+  output_tokens: 128
+  fixtures: OPEN-QUESTION    # candidates in the contract draft; Wenyao to pick
+
+dry_run:
+  # Phase 2 validation of the pipeline only. Performance numbers are meaningless;
+  # tuning from them is forbidden.
+  model: Qwen/Qwen3-1.7B
+  server: "python -m sglang.launch_server"   # plain sglang on the 5090
+  gpu: RTX-5090-32GB
+  tensor_parallel: 1
+  mem_fraction_static: 0.80
+  ladders: { baseline: [1, 4], admission_ab: [1, 4] }
+  arms: { A: { max_running_requests: 4 }, B: { max_running_requests: 16 } }
+  repeats: { aa_arms: 2, ab_pairs: 3 }
+  requests_per_level: 8
+  min_success_per_level: 8
+  output_tokens: 32

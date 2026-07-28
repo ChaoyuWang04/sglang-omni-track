@@ -1,0 +1,222 @@
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+stages:
+- name: preprocessing
+  factory: sglang_omni.models.qwen3_omni.stages.create_preprocessing_executor
+  factory_args:
+    thinker_max_seq_len: 8192
+  next:
+  - image_encoder
+  - audio_encoder
+  - mm_aggregate
+  terminal: false
+  route_fn: sglang_omni.models.qwen3_omni.request_builders.resolve_preprocessing_next_stages
+  gpu: null
+  tp_size: 1
+  parallelism:
+    tp: 1
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: null
+  runtime_arg_map:
+    max_seq_len: thinker_max_seq_len
+    video_fps: video_fps
+  env: {}
+  wait_for: null
+  wait_for_fn: null
+  merge_fn: null
+  stream_to: []
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: false
+  disable_direct_cuda_ipc_payload: false
+  project_payload:
+    image_encoder: sglang_omni.models.qwen3_omni.request_builders.project_preprocessing_to_image_encoder
+    audio_encoder: sglang_omni.models.qwen3_omni.request_builders.project_preprocessing_to_audio_encoder
+    mm_aggregate: sglang_omni.models.qwen3_omni.request_builders.project_preprocessing_to_mm_aggregate
+  comm: null
+- name: image_encoder
+  factory: sglang_omni.models.qwen3_omni.stages.create_image_encoder_executor
+  factory_args:
+    device: cuda
+    dtype: null
+  next: mm_aggregate
+  terminal: false
+  route_fn: null
+  gpu: 0
+  tp_size: 1
+  parallelism:
+    tp: 1
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: null
+  runtime_arg_map: {}
+  env: {}
+  wait_for: null
+  wait_for_fn: null
+  merge_fn: null
+  stream_to: []
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: false
+  disable_direct_cuda_ipc_payload: false
+  project_payload:
+    mm_aggregate: sglang_omni.models.qwen3_omni.request_builders.project_encoder_to_mm_aggregate
+  comm: null
+- name: audio_encoder
+  factory: sglang_omni.models.qwen3_omni.stages.create_audio_encoder_executor
+  factory_args:
+    device: cuda
+    dtype: null
+  next: mm_aggregate
+  terminal: false
+  route_fn: null
+  gpu: 0
+  tp_size: 1
+  parallelism:
+    tp: 1
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: null
+  runtime_arg_map: {}
+  env: {}
+  wait_for: null
+  wait_for_fn: null
+  merge_fn: null
+  stream_to: []
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: false
+  disable_direct_cuda_ipc_payload: false
+  project_payload:
+    mm_aggregate: sglang_omni.models.qwen3_omni.request_builders.project_encoder_to_mm_aggregate
+  comm: null
+- name: mm_aggregate
+  factory: sglang_omni.models.qwen3_omni.stages.create_aggregate_executor
+  factory_args: {}
+  next: thinker
+  terminal: false
+  route_fn: null
+  gpu: 0
+  tp_size: 1
+  parallelism:
+    tp: 1
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: null
+  runtime_arg_map: {}
+  env: {}
+  wait_for:
+  - preprocessing
+  - image_encoder
+  - audio_encoder
+  wait_for_fn: sglang_omni.models.qwen3_omni.request_builders.resolve_mm_aggregate_wait_sources
+  merge_fn: sglang_omni.models.qwen3_omni.merge.merge_for_thinker
+  stream_to: []
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: false
+  disable_direct_cuda_ipc_payload: true
+  project_payload: {}
+  comm: null
+- name: thinker
+  factory: sglang_omni.models.qwen3_omni.stages.create_sglang_thinker_executor_from_config
+  factory_args:
+    thinker_max_seq_len: 8192
+    enable_async_decode: true
+    server_args_overrides:
+      max_running_requests: 16
+      disable_custom_all_reduce: true
+  next: decode
+  terminal: false
+  route_fn: null
+  gpu:
+  - 0
+  - 1
+  tp_size: 2
+  parallelism:
+    tp: 2
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: 0.85
+  runtime_arg_map:
+    max_seq_len: thinker_max_seq_len
+  env: {}
+  wait_for: null
+  wait_for_fn: null
+  merge_fn: null
+  stream_to:
+  - decode
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: false
+  disable_direct_cuda_ipc_payload: false
+  project_payload:
+    decode: sglang_omni.models.qwen3_omni.request_builders.project_thinker_to_decode
+  comm: null
+- name: decode
+  factory: sglang_omni.models.qwen3_omni.stages.create_decode_executor
+  factory_args: {}
+  next: null
+  terminal: true
+  route_fn: null
+  gpu: null
+  tp_size: 1
+  parallelism:
+    tp: 1
+  process: pipeline
+  runtime:
+    resources:
+      total_gpu_memory_fraction: null
+    max_seq_len: null
+    video_fps: null
+    sglang_server_args:
+      mem_fraction_static: null
+  runtime_arg_map: {}
+  env: {}
+  wait_for: null
+  wait_for_fn: null
+  merge_fn: null
+  stream_to: []
+  stream_done_to_fn: null
+  can_accept_stream_before_payload: true
+  disable_direct_cuda_ipc_payload: false
+  project_payload: {}
+  comm: null
+name: Qwen/Qwen3-Omni-30B-A3B-Instruct
+entry_stage: null
+fused_stages: []
+runtime_overrides:
+  thinker:
+    server_args_overrides:
+      decode_log_interval: 8
+      disable_radix_cache: true
+env_defaults:
+  SGLANG_JIT_DEEPGEMM_PRECOMPILE: '0'
+placement:
+  max_total_gpu_memory_fraction_per_gpu: 1.0
+  require_memory_fraction_for_colocation: false
+placement_policy: sglang_omni.models.qwen3_omni.placement.Qwen3OmniPlacementPolicy
+endpoints:
+  base_path: /tmp/sglang_omni
+terminal_stages_fn: null
+config_cls: Qwen3OmniPipelineConfig
